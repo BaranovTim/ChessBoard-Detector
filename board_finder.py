@@ -9,12 +9,15 @@ import chess
 import chess.engine
 import time
 import sys
+import os
 from move_detector import MoveTracker
 
 INTERVAL = 0.5  # seconds between captures; moves are only read once the board is steady for a few captures
 LAST_CAPTURE_TIME = 0
 # How checkerboard-like the found 8x8 area has to be (1.0 = perfect, ~0 = random)
-MIN_CHECKER_SCORE = 0.25
+MIN_CHECKER_SCORE = 0.3
+# How much of the grid's lines must lie on edges in the photo
+MIN_LINES_ON_EDGES = 0.75
 
 MIN_BOARD_LENGTH = 240
 MAX_BOARD_LENGTH = 400
@@ -25,66 +28,119 @@ CLASS_ID_TO_NAME = {
 }
 
 
-def find_lines(edges):
-    # The vote threshold scales with the frame instead of a fixed number, and
-    # pieces only cost a line some votes, they can't cut it in half like a contour
+def find_segments(edges):
+    # Straight stretches of edge as (x1, y1, x2, y2)
     h, w = edges.shape
-    lines = cv.HoughLines(edges, 1, np.pi / 180, threshold=int(0.2 * min(h, w)))
-    if lines is None:
-        return None
-    return lines[:400, 0]  # HoughLines returns the strongest lines first
+    segments = cv.HoughLinesP(edges, 1, np.pi / 180, threshold=15, minLineLength=max(10, int(0.04 * min(h, w))), maxLineGap=3)
+    return None if segments is None else segments.reshape(-1, 4).astype(np.float64)
 
 
-def angle_diff(a, b):
-    # difference between two line directions in degrees, 0..90 (180 deg = same line)
-    d = np.abs(a - b) % 180
-    return np.minimum(d, 180 - d)
+def vanishing_points(segments, count=3, max_angle=2.0):
+    # In a photo the lines of each board direction meet in one point (a
+    # vanishing point; far away, or "at infinity" when they look parallel).
+    # Seen from a seated player the files fan out over ~90 degrees, so
+    # grouping lines by angle fails, but they still all point at one spot.
+    # Try the crossing of pairs of long segments as that spot, and keep the
+    # spots the most segment length points at. A segment only counts if the
+    # spot lies beyond its ends, so places where grid lines cross don't count.
+    # Returns [(point, member mask)], point homogeneous (x, y, 1) or (dx, dy, 0)
+    p1, p2 = segments[:, :2], segments[:, 2:]
+    length = np.linalg.norm(p2 - p1, axis=1)
+    mid, d = (p1 + p2) / 2, (p2 - p1) / length[:, None]
+    lines = np.cross(np.column_stack([p1, np.ones(len(p1))]), np.column_stack([p2, np.ones(len(p2))]))
 
+    longest = np.argsort(-length)[:80]
+    i, j = np.triu_indices(len(longest), 1)
+    cands = np.cross(lines[longest[i]], lines[longest[j]])
+    cands = cands[np.linalg.norm(cands[:, :2], axis=1) > 1e-9]
+    if len(cands) == 0:
+        return []
+    cands /= np.linalg.norm(cands, axis=1, keepdims=True)
 
-def direction_pairs(lines, spread=30, peaks=4):
-    # Board lines come in two main directions, but with strong perspective one
-    # of them fans out and piece edges add diagonal junk. So take the few most
-    # common directions and return every plausible pair; the checkerboard
-    # test later decides which pair is the board
-    angles = np.degrees(lines[:, 1]) % 180
-    hist = np.bincount(angles.astype(int) % 180, minlength=180).astype(float)
-    hist = np.convolve(np.concatenate([hist[-10:], hist, hist[:10]]), np.ones(21), 'valid')
-    tops = []
-    for _ in range(peaks):
-        if hist.max() <= 0:
+    def support(v):
+        # for each segment (rows) and point (columns): does the segment point
+        # at the point, with the point beyond the segment's ends?
+        u = v[None, :, :2] - mid[:, None, :] * v[None, :, 2:3]  # direction from the segment to v (scaled)
+        sin = np.abs(d[:, None, 0] * u[..., 1] - d[:, None, 1] * u[..., 0]) / (np.linalg.norm(u, axis=2) + 1e-12)
+        far = np.abs(v[None, :, 2])
+        along = np.abs((u * d[:, None, :]).sum(axis=2)) / np.maximum(far, 1e-12)
+        beyond = (far < 1e-9) | (along > length[:, None] / 2 + 2)
+        return (sin < np.sin(np.radians(max_angle))) & beyond
+
+    points_at = support(cands)
+    used = np.zeros(len(segments), bool)
+    found = []
+    for _ in range(count):
+        scores = (points_at[~used] * length[~used, None]).sum(axis=0)
+        best = int(np.argmax(scores))
+        best_members = points_at[:, best] & ~used
+        if best_members.sum() < 4:
             break
-        top = int(np.argmax(hist))
-        tops.append(top)
-        hist[angle_diff(np.arange(180), top) < 30] = 0
+        # refit the point to all its segments: the point closest to all their lines
+        n = lines[best_members] / np.linalg.norm(lines[best_members][:, :2], axis=1, keepdims=True)
+        v = np.linalg.eigh((n * length[best_members, None]).T @ n)[1][:, 0]
+        members = support(v[None, :])[:, 0] & ~used
+        found.append((v, members))
+        used |= members
+    return found
+
+
+def to_rho_theta(line):
+    # homogeneous line (a, b, c) -> (rho, theta) as HoughLines gives them
+    a, b, c = line / np.linalg.norm(line[:2])
+    theta, rho = np.arctan2(b, a), -c
+    if theta < 0:
+        theta, rho = theta + np.pi, -rho
+    return rho, theta
+
+
+def snapped_lines(segments, members, point, reference, middle, min_gap, keep=25):
+    # The board lines of one direction: every segment of the set is turned into
+    # the line through the vanishing point and the segment's middle, and lines
+    # that cross the reference line within min_gap pixels of each other are
+    # merged (weighted by segment length). Returns (rho, theta) sorted across the board
+    seg = segments[members]
+    length = np.linalg.norm(seg[:, 2:] - seg[:, :2], axis=1)
+    mids = np.column_stack([(seg[:, :2] + seg[:, 2:]) / 2, np.ones(len(seg))])
+    crossings = np.cross(np.cross(point[None, :], mids), reference[None, :])
+    ok = np.abs(crossings[:, 2]) > 1e-9
+    direction = np.array([reference[1], -reference[0]]) / np.linalg.norm(reference[:2])
+    pos = (crossings[ok, :2] / crossings[ok, 2:3] - middle[:2]) @ direction
+    length = length[ok]
+    order = np.argsort(pos)
+    groups = []  # [sum of length * pos, sum of length]
+    last = None
+    for k in order:
+        if last is not None and pos[k] - last < min_gap:
+            groups[-1][0] += length[k] * pos[k]
+            groups[-1][1] += length[k]
+        else:
+            groups.append([length[k] * pos[k], length[k]])
+        last = pos[k]
+    groups = sorted(groups, key=lambda g: -g[1])[:keep]
+    spots = sorted(g[0] / g[1] for g in groups)
+    lines = [to_rho_theta(np.cross(point, np.append(middle[:2] + t * direction, 1.0))) for t in spots]
+    return np.array(lines)
+
+
+def family_pairs(edges, min_gap):
+    # Pairs of board-line sets, one per vanishing point, each sorted across the board
+    segments = find_segments(edges)
+    if segments is None or len(segments) < 8:
+        return []
+    points = vanishing_points(segments)
     pairs = []
-    for i in range(len(tops)):
-        for j in range(i + 1, len(tops)):
-            if angle_diff(tops[i], tops[j]) < 40:
-                continue
-            to_i, to_j = angle_diff(angles, tops[i]), angle_diff(angles, tops[j])
-            a = lines[(to_i < spread) & (to_i <= to_j)]
-            b = lines[(to_j < spread) & (to_j < to_i)]
+    for i in range(len(points)):
+        for j in range(i + 1, len(points)):
+            (va, ma), (vb, mb) = points[i], points[j]
+            both = segments[ma | mb]
+            middle = np.append(np.median((both[:, :2] + both[:, 2:]) / 2, axis=0), 1.0)
+            # sort each set along the line of the other set through the middle
+            a = snapped_lines(segments, ma, va, np.cross(middle, vb), middle, min_gap)
+            b = snapped_lines(segments, mb, vb, np.cross(middle, va), middle, min_gap)
             if len(a) >= 2 and len(b) >= 2:
                 pairs.append((a, b))
     return pairs
-
-
-def merge_close_lines(lines, center, min_gap, keep=25):
-    # Flip every normal to point the same way, measure each line's signed
-    # distance from the image center, and drop near-duplicates of stronger lines
-    mean_angle = 0.5 * math.atan2(np.sin(2 * lines[:, 1]).mean(), np.cos(2 * lines[:, 1]).mean())
-    kept = []  # (position, theta, rho)
-    for rho, theta in lines:
-        if math.cos(theta - mean_angle) < 0:
-            rho, theta = -rho, theta - np.pi
-        pos = rho - (center[0] * math.cos(theta) + center[1] * math.sin(theta))
-        if any(abs(pos - p) < min_gap and abs(theta - t) < np.radians(5) for p, t, _ in kept):
-            continue
-        kept.append((pos, theta, rho))
-        if len(kept) == keep:
-            break
-    kept.sort()
-    return np.array([(rho, theta) for _, theta, rho in kept])
 
 
 def intersections(lines_a, lines_b):
@@ -136,20 +192,23 @@ def fit_grid(points, img_shape):
             ok, grid = lattice_inliers(H, flat)
             count = len(np.unique(grid[ok], axis=0))
             if count >= 16:
-                candidates[ok.tobytes()] = (count, H, grid[ok])
+                candidates[ok.tobytes()] = (count, H, grid[ok], flat[ok])
     # the same grid is found from many starting squares, keep each one once
     return sorted(candidates.values(), key=lambda c: -c[0])
 
 
 def pick_8x8(img, H, grid_pts, px=16):
     # The grid may be missing its outer lines (hidden by pieces) or include
-    # extra ones (board frame), so slide an 8x8 window over it and keep the
-    # spot that holds the most squares of the right colour
+    # extra ones (board frame, table edge, lines in the background), so slide an
+    # 8x8 window over it and keep the spot that holds the most squares of the
+    # right colour
     xmin, ymin = grid_pts.min(axis=0).astype(int)
     xmax, ymax = grid_pts.max(axis=0).astype(int)
-    x_lo, x_hi = min(xmin, xmax - 8), max(xmax, xmin + 8)
-    y_lo, y_hi = min(ymin, ymax - 8), max(ymax, ymin + 8)
-    nx, ny = x_hi - x_lo, y_hi - y_lo
+    # a window may stick out at most 2 lines past the lines that were found
+    xs = range(xmin - 2, max(xmin - 2, xmax - 6) + 1)
+    ys = range(ymin - 2, max(ymin - 2, ymax - 6) + 1)
+    x_lo, y_lo = xs[0] - 1, ys[0] - 1  # one extra ring of cells to look past the window's edges
+    nx, ny = xs[-1] + 9 - x_lo, ys[-1] + 9 - y_lo
 
     to_px = np.array([[px, 0, -x_lo * px], [0, px, -y_lo * px], [0, 0, 1]], dtype=np.float64)
     M = to_px @ H
@@ -158,38 +217,101 @@ def pick_8x8(img, H, grid_pts, px=16):
     inside = cv.warpPerspective(np.ones(img.shape[:2], np.uint8), M, (nx * px, ny * px), flags=cv.INTER_NEAREST)
     m = px // 6  # ignore the cell borders
     cells = flat.reshape(ny, px, nx, px, 3)[:, m:-m, :, m:-m].transpose(0, 2, 1, 3, 4)  # (row, col, y, x, colour)
-    cells_inside = inside.reshape(ny, px, nx, px)[:, m:-m, :, m:-m].mean(axis=(1, 3)) >= 0.9
+    visible = inside.reshape(ny, px, nx, px)[:, m:-m, :, m:-m].transpose(0, 2, 1, 3) > 0  # pixels inside the photo
 
-    # The two square colours: the median colour of each half of the checker
-    # pattern, taken between the grid lines that were actually found
+    # Cells past the horizon (seen from a low angle the grid's pattern continues
+    # into the background and "behind" the camera) aren't on the table
+    to_image = np.linalg.inv(H)
+    gx, gy = np.meshgrid(np.arange(nx) + x_lo + 0.5, np.arange(ny) + y_lo + 0.5)
+    w = to_image[2, 0] * gx + to_image[2, 1] * gy + to_image[2, 2]
+    w_found = to_image[2] @ [grid_pts[:, 0].mean(), grid_pts[:, 1].mean(), 1]
+    visible &= (w * w_found > 0)[:, :, None, None]
+    share_visible = visible.mean(axis=(2, 3))
+    cells_inside = share_visible >= 0.9
+
     parity = np.add.outer(np.arange(ny) + y_lo, np.arange(nx) + x_lo) % 2
-    core = np.zeros((ny, nx), bool)
-    core[ymin - y_lo:ymax - y_lo, xmin - x_lo:xmax - x_lo] = True
-    core &= cells_inside
-    if not (core & (parity == 0)).any() or not (core & (parity == 1)).any():
-        return None, 0
-    colour0 = np.median(cells[core & (parity == 0)].reshape(-1, 3), axis=0)
-    colour1 = np.median(cells[core & (parity == 1)].reshape(-1, 3), axis=0)
-    gap = np.linalg.norm(colour0 - colour1)
-    if gap < 15:
-        return None, 0  # both halves look the same: not a checkerboard
-
-    # For every square: share of pixels in the colour it should have minus
-    # share in the other one. Pieces match neither colour, so a square that is
-    # half hidden by a piece still counts; the frame and table score ~0
-    near0 = (np.linalg.norm(cells - colour0, axis=-1) < gap / 2).mean(axis=(2, 3))
-    near1 = (np.linalg.norm(cells - colour1, axis=-1) < gap / 2).mean(axis=(2, 3))
-    fits = np.where(parity == 0, near0 - near1, near1 - near0)
+    typical = np.median(cells.reshape(ny, nx, -1, 3), axis=2)  # one colour per cell
+    found_x, found_y = set(grid_pts[:, 0].astype(int)), set(grid_pts[:, 1].astype(int))
 
     best_score, best_xy = -1, None
-    for y0 in range(ny - 7):
-        for x0 in range(nx - 7):
+    for y0 in range(1, ny - 8):
+        for x0 in range(1, nx - 8):
             if not cells_inside[y0:y0 + 8, x0:x0 + 8].all():
                 continue
-            score = fits[y0:y0 + 8, x0:x0 + 8].mean()
+            # the whole playing area, corners included, must be in the photo
+            gx0, gy0 = x0 + x_lo, y0 + y_lo
+            corners = cv.perspectiveTransform(np.float32([[gx0, gy0], [gx0 + 8, gy0], [gx0 + 8, gy0 + 8], [gx0, gy0 + 8]]).reshape(-1, 1, 2), to_image).reshape(-1, 2)
+            if (corners < -2).any() or (corners[:, 0] > img.shape[1] + 1).any() or (corners[:, 1] > img.shape[0] + 1).any():
+                continue
+            # Most of the window's 9 + 9 grid lines must be lines that were
+            # actually seen, otherwise it's a grid of the wrong size
+            if len(found_x & set(range(x0 + x_lo, x0 + x_lo + 9))) < 5 or len(found_y & set(range(y0 + y_lo, y0 + y_lo + 9))) < 5:
+                continue
+            # The two square colours of this window: the typical colour of
+            # each half of the checker pattern
+            win, par = cells[y0:y0 + 8, x0:x0 + 8], parity[y0:y0 + 8, x0:x0 + 8]
+            colour0 = np.median(typical[y0:y0 + 8, x0:x0 + 8][par == 0], axis=0)
+            colour1 = np.median(typical[y0:y0 + 8, x0:x0 + 8][par == 1], axis=0)
+            gap = np.linalg.norm(colour0 - colour1)
+            if gap < 15:
+                continue  # both halves look the same: not a checkerboard
+            # For every square of the window and the ring around it: which of
+            # the two colours it shows, +1 or -1, or 0 when unsure. Pieces match
+            # neither colour, so a square half hidden by a piece still shows its
+            # colour; the frame, table and background come out unsure
+            r0, c0 = y0 - 1, x0 - 1
+            area, seen = cells[r0:y0 + 9, c0:x0 + 9], visible[r0:y0 + 9, c0:x0 + 9]
+            count = np.maximum(seen.sum(axis=(2, 3)), 1)
+            near0 = ((np.linalg.norm(area - colour0, axis=-1) < gap / 2) & seen).sum(axis=(2, 3)) / count
+            near1 = ((np.linalg.norm(area - colour1, axis=-1) < gap / 2) & seen).sum(axis=(2, 3)) / count
+            ring = near0 - near1
+            ring_seen = share_visible[r0:y0 + 9, c0:x0 + 9] >= 0.15
+            light = (near0 if colour0[0] > colour1[0] else near1) * ring_seen  # share of light-square colour
+            ring = np.where((np.abs(ring) < 0.15) | ~ring_seen, 0, np.sign(ring))
+            shade = ring[y0 - r0:y0 - r0 + 8, x0 - c0:x0 - c0 + 8]
+            # If the checker pattern clearly carries on past an edge (the row
+            # outside alternates by itself and against the edge row), this
+            # window is only part of the board: shifted, or the board is cut
+            # off there. A plain frame or table row doesn't alternate.
+            outside = [(ring[0, 1:9], shade[0]), (ring[9, 1:9], shade[7]), (ring[1:9, 0], shade[:, 0]), (ring[1:9, 9], shade[:, 7])]
+            if any(-(out[:-1] * out[1:]).sum() >= 3 and -(out * edge).sum() >= 3 for out, edge in outside):
+                continue
+            # Light squares just past an edge: the board carries on there (its
+            # frame is dark wood, never the light-square colour). Squares near
+            # the camera hide behind big pieces, so two clear ones are enough
+            past = [light[0, 1:9], light[9, 1:9], light[1:9, 0], light[1:9, 9]]
+            if any((side >= 0.5).sum() >= 2 or (side >= 0.4).sum() >= 3 for side in past):
+                continue
+            # An edge row that is all one colour is the board's frame (its wood
+            # can look like the dark squares), so the window is shifted onto it
+            if any(-(edge[:-1] * edge[1:]).sum() <= -3 for _, edge in outside):
+                continue
+            # On a chessboard neighbours always differ, side by side and above
+            # and below: +1 for every pair that differs, -1 for every pair that
+            # matches. A grid of the wrong size has neighbours inside the same
+            # square, so check both directions and keep the worse one
+            across = -(shade[:, :-1] * shade[:, 1:]).mean()
+            down = -(shade[:-1, :] * shade[1:, :]).mean()
+            score = min(across, down)
             if score > best_score:
                 best_score, best_xy = score, (x0 + x_lo, y0 + y_lo)
     return best_xy, best_score
+
+
+def lines_on_edges(edges, H, xy):
+    # Share of the window's inner grid lines (between squares) that lies on
+    # edges in the photo. Real square borders show up as edges wherever no
+    # piece covers them; a grid built from unrelated lines crosses the squares
+    near = cv.dilate(edges, np.ones((3, 3), np.uint8)) > 0
+    to_image = np.linalg.inv(H)
+    t = np.linspace(0.05, 7.95, 60)
+    hits = []
+    for k in range(1, 8):
+        for pts in (np.column_stack([np.full_like(t, k), t]), np.column_stack([t, np.full_like(t, k)])):
+            q = cv.perspectiveTransform((pts + xy).reshape(-1, 1, 2).astype(np.float32), to_image).reshape(-1, 2).round().astype(int)
+            ok = (q[:, 0] >= 0) & (q[:, 0] < edges.shape[1]) & (q[:, 1] >= 0) & (q[:, 1] < edges.shape[0])
+            hits.append(near[q[ok, 1], q[ok, 0]].mean() if ok.any() else 0)
+    return float(np.mean(hits))
 
 
 def order_corners(corners):
@@ -202,23 +324,25 @@ def order_corners(corners):
 
 def find_board_corners(img, edges, debug=None):
     # Returns the 4 corners of the 8x8 playing area (not the board frame) or None
-    lines = find_lines(edges)
-    if lines is None or len(lines) < 4:
-        return None, 'not enough lines'
-    center = (img.shape[1] / 2, img.shape[0] / 2)
     min_gap = max(4, 0.015 * min(img.shape[:2]))
 
     # A grid with half-size squares or one built from diagonals can have just
     # as many crossings as the real one, but it won't look like a checkerboard
-    best = (-1, None, None, 0, None)
-    for a, b in direction_pairs(lines):
-        a = merge_close_lines(a, center, min_gap)
-        b = merge_close_lines(b, center, min_gap)
-        for count, H, grid_pts in fit_grid(intersections(a, b), img.shape)[:10]:
+    best = (-1, None, None, 0, None, None, None)
+    for a, b in family_pairs(edges, min_gap):
+        for count, H, grid_pts, img_pts in fit_grid(intersections(a, b), img.shape)[:10]:
             xy, score = pick_8x8(img, H, grid_pts)
-            if xy is not None and score > best[0]:
-                best = (score, H, xy, count, (a, b))
-    score, H, xy, count, best_lines = best
+            if xy is None or score <= best[0]:
+                continue
+            on_edges = lines_on_edges(edges, H, xy)
+            if on_edges < MIN_LINES_ON_EDGES:
+                continue
+            best = (score, H, xy, count, (a, b), grid_pts, img_pts)
+            if score > 0.5 and on_edges > 0.85:
+                break  # clearly the board, no need to look further
+        if best[0] > 0.5:
+            break
+    score, H, xy, count, best_lines, grid_pts, img_pts = best
     if xy is None:
         return None, 'no grid found'
 
@@ -231,8 +355,16 @@ def find_board_corners(img, edges, debug=None):
     if score < MIN_CHECKER_SCORE:
         return None, f'no checkerboard pattern (board score {score:.2f})'
     x0, y0 = xy
+    # Fit the board once more using only the line crossings on it; crossings
+    # out in the background pull the fit around
+    on_board = (grid_pts[:, 0] >= x0) & (grid_pts[:, 0] <= x0 + 8) & (grid_pts[:, 1] >= y0) & (grid_pts[:, 1] <= y0 + 8)
+    if on_board.sum() >= 8:
+        refit, _ = cv.findHomography(grid_pts[on_board].astype(np.float32), img_pts[on_board])
+        to_image = refit if refit is not None else np.linalg.inv(H)
+    else:
+        to_image = np.linalg.inv(H)
     board = np.float32([[x0, y0], [x0 + 8, y0], [x0 + 8, y0 + 8], [x0, y0 + 8]])
-    corners = cv.perspectiveTransform(board.reshape(-1, 1, 2), np.linalg.inv(H)).reshape(-1, 2)
+    corners = cv.perspectiveTransform(board.reshape(-1, 1, 2), to_image).reshape(-1, 2)
     return order_corners(corners), f'{count} line crossings, board score {score:.2f}'
 
 
@@ -347,6 +479,9 @@ if __name__ == '__main__':
     if not camera.isOpened():
         print("Не удалось открыть камеру")
         exit()
+    # A video file is read much faster than real time, so time it by the video's
+    # own clock; otherwise most of each move would be skipped
+    from_file = os.path.isfile(source)
 
     tracker = MoveTracker()
     print("Set up the starting position. Keys (in a camera window): q = quit, r = new game,")
@@ -358,7 +493,7 @@ if __name__ == '__main__':
             print("Не удалось считать кадр")
             break
 
-        now = time.time()
+        now = camera.get(cv.CAP_PROP_POS_MSEC) / 1000 if from_file else time.time()
         if now - LAST_CAPTURE_TIME >= INTERVAL:
             cv.imshow('Screenshot',frame)
             tracker.update(detect_chessboard(frame), frame)
