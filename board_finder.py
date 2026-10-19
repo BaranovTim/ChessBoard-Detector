@@ -11,11 +11,13 @@ import time
 import sys
 import os
 from move_detector import MoveTracker
+from board_tracker import BoardTracker
 
 INTERVAL = 0.5  # seconds between captures; moves are only read once the board is steady for a few captures
+FOLLOW_INTERVAL = 0.1  # the board is followed more often, so it moves little between looks
 LAST_CAPTURE_TIME = 0
 # How checkerboard-like the found 8x8 area has to be (1.0 = perfect, ~0 = random)
-MIN_CHECKER_SCORE = 0.3
+MIN_CHECKER_SCORE = 0.37
 # How much of the grid's lines must lie on edges in the photo
 MIN_LINES_ON_EDGES = 0.75
 
@@ -241,7 +243,9 @@ def pick_8x8(img, H, grid_pts, px=16):
             # the whole playing area, corners included, must be in the photo
             gx0, gy0 = x0 + x_lo, y0 + y_lo
             corners = cv.perspectiveTransform(np.float32([[gx0, gy0], [gx0 + 8, gy0], [gx0 + 8, gy0 + 8], [gx0, gy0 + 8]]).reshape(-1, 1, 2), to_image).reshape(-1, 2)
-            if (corners < -2).any() or (corners[:, 0] > img.shape[1] + 1).any() or (corners[:, 1] > img.shape[0] + 1).any():
+            # (outer lines hidden by the frame are estimated, so allow a quarter square)
+            slack = max(2, 0.25 * np.linalg.norm(corners - np.roll(corners, 1, axis=0), axis=1).mean() / 8)
+            if (corners < -slack).any() or (corners[:, 0] > img.shape[1] + slack).any() or (corners[:, 1] > img.shape[0] + slack).any():
                 continue
             # Most of the window's 9 + 9 grid lines must be lines that were
             # actually seen, otherwise it's a grid of the wrong size
@@ -276,11 +280,12 @@ def pick_8x8(img, H, grid_pts, px=16):
             outside = [(ring[0, 1:9], shade[0]), (ring[9, 1:9], shade[7]), (ring[1:9, 0], shade[:, 0]), (ring[1:9, 9], shade[:, 7])]
             if any(-(out[:-1] * out[1:]).sum() >= 3 and -(out * edge).sum() >= 3 for out, edge in outside):
                 continue
-            # Light squares just past an edge: the board carries on there (its
-            # frame is dark wood, never the light-square colour). Squares near
-            # the camera hide behind big pieces, so two clear ones are enough
+            # Light and darker cells taking turns just past an edge: the board
+            # carries on there. A frame is one colour all along (dark wood, or a
+            # light band with the coordinates printed on it), real squares
+            # alternate even when big pieces near the camera hide half of them
             past = [light[0, 1:9], light[9, 1:9], light[1:9, 0], light[1:9, 9]]
-            if any((side >= 0.5).sum() >= 2 or (side >= 0.4).sum() >= 3 for side in past):
+            if any(abs(side[0::2].mean() - side[1::2].mean()) >= 0.3 for side in past):
                 continue
             # An edge row that is all one colour is the board's frame (its wood
             # can look like the dark squares), so the window is shifted onto it
@@ -385,85 +390,88 @@ def detect_chessboard(frame):
         board_corners, info = find_board_corners(frame, canny_img, debug=img)
         cv.imshow('Lines', img)
 
-        is_board = board_corners is not None
-
-        # we divide the board into 64 pieces with angle consideration
-        if is_board == True:
-            new_board = frame.copy()
-            
-            # Calculate the size of the board in the transformed space
-            # We'll use a standard 8x8 grid size for the transformed image
-            grid_size = 400  # Size of the transformed board image
-            square_size = grid_size // 8
-            
-            # Define the destination corners for perspective transform
-            dst_corners = np.array([
-                [0, 0],                    # Top-left
-                [grid_size, 0],            # Top-right
-                [grid_size, grid_size],    # Bottom-right
-                [0, grid_size]             # Bottom-left
-            ], dtype=np.float32)
-            
-            # Calculate perspective transform matrix
-            perspective_matrix = cv.getPerspectiveTransform(board_corners, dst_corners)
-            
-            # Apply perspective transform to get the straightened board
-            transformed_board = cv.warpPerspective(new_board, perspective_matrix, (grid_size, grid_size))
-            
-            # Draw the detected board corners on the original image
-            for i, corner in enumerate(board_corners):
-                cv.circle(new_board, tuple(corner.astype(int)), 5, (0, 0, 255), -1)
-                cv.putText(new_board, str(i), tuple(corner.astype(int)), 
-                          cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            
-            # Create 8x8 grid of squares on the transformed board
-            squares_grid = []
-            for row in range(8):
-                for col in range(8):
-                    # Calculate square coordinates in transformed space
-                    x1 = col * square_size
-                    y1 = row * square_size
-                    x2 = (col + 1) * square_size
-                    y2 = (row + 1) * square_size
-                    
-                    # Extract square from the transformed board
-                    square = transformed_board[y1:y2, x1:x2]
-                    
-                    # Calculate the corresponding coordinates in the original image
-                    # Transform the square corners back to original image space
-                    square_corners_transformed = np.array([
-                        [x1, y1],
-                        [x2, y1],
-                        [x2, y2],
-                        [x1, y2]
-                    ], dtype=np.float32)
-                    
-                    # Apply inverse perspective transform
-                    inverse_matrix = cv.getPerspectiveTransform(dst_corners, board_corners)
-                    square_corners_original = cv.perspectiveTransform(
-                        square_corners_transformed.reshape(-1, 1, 2), inverse_matrix
-                    ).reshape(-1, 2)
-                    
-                    # Draw the transformed square on the original image
-                    square_corners_original_int = square_corners_original.astype(int)
-                    cv.polylines(new_board, [square_corners_original_int], True, (0, 255, 0), 2)
-                    
-                    # Add square coordinates and content to the grid
-                    squares_grid.append({
-                        'position': (row, col),
-                        'coordinates_transformed': (x1, y1, x2, y2),
-                        'coordinates_original': square_corners_original.tolist(),
-                        'content': square
-                    })
-                
-            # Display both the original image with drawn squares and the transformed board
-            cv.imshow('Divided Chess Board (Original)', new_board)
-            cv.imshow('Transformed Chess Board', transformed_board)
-
-            return squares_grid
+        if board_corners is not None:
+            return split_board(frame, board_corners)
         else:
             print(f"no chessboard detected ({info}), trying again")
             return None
+
+
+def split_board(frame, board_corners):
+        # we divide the board into 64 pieces with angle consideration
+        new_board = frame.copy()
+        
+        # Calculate the size of the board in the transformed space
+        # We'll use a standard 8x8 grid size for the transformed image
+        grid_size = 400  # Size of the transformed board image
+        square_size = grid_size // 8
+        
+        # Define the destination corners for perspective transform
+        dst_corners = np.array([
+            [0, 0],                    # Top-left
+            [grid_size, 0],            # Top-right
+            [grid_size, grid_size],    # Bottom-right
+            [0, grid_size]             # Bottom-left
+        ], dtype=np.float32)
+        
+        # Calculate perspective transform matrix
+        perspective_matrix = cv.getPerspectiveTransform(board_corners, dst_corners)
+        
+        # Apply perspective transform to get the straightened board
+        transformed_board = cv.warpPerspective(new_board, perspective_matrix, (grid_size, grid_size))
+        
+        # Draw the detected board corners on the original image
+        for i, corner in enumerate(board_corners):
+            cv.circle(new_board, tuple(corner.astype(int)), 5, (0, 0, 255), -1)
+            cv.putText(new_board, str(i), tuple(corner.astype(int)), 
+                      cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Create 8x8 grid of squares on the transformed board
+        squares_grid = []
+        for row in range(8):
+            for col in range(8):
+                # Calculate square coordinates in transformed space
+                x1 = col * square_size
+                y1 = row * square_size
+                x2 = (col + 1) * square_size
+                y2 = (row + 1) * square_size
+                
+                # Extract square from the transformed board
+                square = transformed_board[y1:y2, x1:x2]
+                
+                # Calculate the corresponding coordinates in the original image
+                # Transform the square corners back to original image space
+                square_corners_transformed = np.array([
+                    [x1, y1],
+                    [x2, y1],
+                    [x2, y2],
+                    [x1, y2]
+                ], dtype=np.float32)
+                
+                # Apply inverse perspective transform
+                inverse_matrix = cv.getPerspectiveTransform(dst_corners, board_corners)
+                square_corners_original = cv.perspectiveTransform(
+                    square_corners_transformed.reshape(-1, 1, 2), inverse_matrix
+                ).reshape(-1, 2)
+                
+                # Draw the transformed square on the original image
+                square_corners_original_int = square_corners_original.astype(int)
+                cv.polylines(new_board, [square_corners_original_int], True, (0, 255, 0), 2)
+                
+                # Add square coordinates and content to the grid
+                squares_grid.append({
+                    'position': (row, col),
+                    'coordinates_transformed': (x1, y1, x2, y2),
+                    'coordinates_original': square_corners_original.tolist(),
+                    'content': square
+                })
+            
+        # Display both the original image with drawn squares and the transformed board
+        cv.imshow('Divided Chess Board (Original)', new_board)
+        cv.imshow('Transformed Chess Board', transformed_board)
+
+        return squares_grid
+
 
 if __name__ == '__main__':
     # Camera number (default 0), a video file or a stream URL:
@@ -483,9 +491,14 @@ if __name__ == '__main__':
     # own clock; otherwise most of each move would be skipped
     from_file = os.path.isfile(source)
 
+    board = BoardTracker(find_board_corners, find_segments)
     tracker = MoveTracker()
-    print("Set up the starting position. Keys (in a camera window): q = quit, r = new game,")
+    print("Point the camera at the whole board, best before setting up the pieces.")
+    print("Keys (in a camera window): q = quit, r = new game, b = find the board again,")
     print("u = take back a wrongly recognised move, m = type the move that was played")
+    last_status = None
+    last_follow = 0
+    corners = None
 
     while True:
         ret, frame = camera.read()
@@ -494,10 +507,26 @@ if __name__ == '__main__':
             break
 
         now = camera.get(cv.CAP_PROP_POS_MSEC) / 1000 if from_file else time.time()
-        if now - LAST_CAPTURE_TIME >= INTERVAL:
-            cv.imshow('Screenshot',frame)
-            tracker.update(detect_chessboard(frame), frame)
-            LAST_CAPTURE_TIME = now
+        if now - last_follow >= FOLLOW_INTERVAL:
+            # Find the board once, then follow it as the camera moves
+            was_searching = board.state == 'searching'
+            corners = board.update(frame)
+            last_follow = now
+            if was_searching and board.state == 'locked' and board.empty and corners is not None and tracker.empty is None and tracker.reference is None:
+                tracker.set_empty_board(split_board(frame, corners), frame)  # only at the first lock, before the game
+
+            shown = frame.copy()
+            if corners is not None:
+                cv.polylines(shown, [corners.astype(np.int32)], True, (0, 255, 0), 2)
+            cv.putText(shown, board.status, (10, 25), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv.imshow('Screenshot', shown)
+            if board.status != last_status and not board.status.startswith('Looking'):
+                print(board.status)
+            last_status = board.status
+
+            if now - LAST_CAPTURE_TIME >= INTERVAL:
+                tracker.update(split_board(frame, corners) if corners is not None else None, frame)
+                LAST_CAPTURE_TIME = now
 
         key = cv.waitKey(1) & 0xFF
         if key == ord('q'):
@@ -505,6 +534,9 @@ if __name__ == '__main__':
         if key == ord('r'):
             tracker.reset()
             print("New game: set up the starting position")
+        if key == ord('b'):
+            board.reset()
+            print("Looking for the board again")
         if key == ord('u'):
             tracker.undo()
         if key == ord('m'):

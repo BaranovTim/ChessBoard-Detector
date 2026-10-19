@@ -247,6 +247,22 @@ class MoveTracker:
         self.last_touched = None  # squares of the last recognised move
         self.history = []      # (number of moves, reference before them) for undo
         self.paused = False    # after an undo, wait for the user to type the right move
+        self.empty = None      # picture of the empty board, if the board was found before the pieces were set up
+
+    def set_empty_board(self, squares_grid, frame):
+        # The board was found while still empty: remember what it looks like,
+        # so the game only starts once the starting position is set up
+        self.empty = top_down(frame, squares_grid)
+
+    def looks_like_start(self, img, seen, columns, look, square_area):
+        # Compared with the empty board: are both players' two home rows full?
+        # (a pause half-way through setting up must not count as the start)
+        empty, _, empty_seen = self.empty  # (picture, homography back to the camera, part the camera saw)
+        turns = best_rotation(img, empty)
+        empty, empty_seen = rotate(empty, turns), rotate(empty_seen, turns)
+        changed = change_map(empty, align(empty, img)) & look & empty_seen & seen
+        full = np.array([[(changed & columns[r, c]).sum() >= MIN_PIECE_AREA * square_area for c in range(8)] for r in range(8)])
+        return any((f.sum(axis=1)[[0, 1, 6, 7]] >= 6).all() for f in (full, full.T))
 
     def warn(self, text):
         if text != self.warned:
@@ -321,6 +337,9 @@ class MoveTracker:
             return None
 
         if self.reference is None:
+            if self.empty is not None and not self.looks_like_start(img, seen, columns, look, square_area):
+                self.warn("Waiting for the starting position to be set up")
+                return None
             turns = find_orientation(img)
             self.reference, self.reference_seen = rotate(img, turns), rotate(seen, turns)
             self.last, self.last_seen = self.reference, self.reference_seen
